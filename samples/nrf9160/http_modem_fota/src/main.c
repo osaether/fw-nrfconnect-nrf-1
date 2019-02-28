@@ -1,4 +1,9 @@
-/*$$$LICENCE_NORDIC_STANDARD<2016>$$$*/
+/*
+ * Copyright (c) 2019 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-BSD-5-Clause-Nordic
+ */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -95,9 +100,7 @@ static void app_modem_dfu_init(void)
     __ASSERT(retval != -1, "Firmware revision request failed.");
     app_modem_firmware_revision_validate(&revision);
     char * r = revision;
-    printk("Revision = \n");
-    printk("    %x%x%x%x%x%x-%x%x%x%x%x%x-%x%x%x%x%x%x\n", r[0],r[1],r[2],r[3],r[4],r[5], r[6],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15],r[16],r[17]);
-    printk("    %x%x%x%x%x%x-%x%x%x%x%x%x-%x%x%x%x%x%x\n", r[18],r[19],r[20],r[21],r[22],r[23], r[24],r[25],r[26],r[27],r[28],r[29],r[30],r[31],r[32],r[33],r[34],r[35]);
+    LOG_HEXDUMP_INF(r, 36, "Revision");
 
     // Get available resources to improve chances of a successful upgrade.
     nrf_dfu_fw_resource_t resource;
@@ -117,11 +120,21 @@ static void app_modem_dfu_init(void)
                             NRF_SO_DFU_OFFSET,
                             &offset,
                             &optlen);
-    __ASSERT(retval != -1, "Offset request failed.");
+    if (retval == -1) {
+        // Delete the backup
+        retval = nrf_setsockopt(m_modem_dfu_fd,
+                             NRF_SOL_DFU,
+                             NRF_SO_DFU_BACKUP_DELETE,
+                             NULL,
+                             0);
+        __ASSERT(retval != -1, "Failed to reset offset.\n");
+        LOG_INF("Reset offset.\n");
+    }
 
     if (offset != 0)
     {
         dfu.offset = offset;
+
     }
 
     retval = dfu_client_init(&dfu);
@@ -141,7 +154,7 @@ static void app_modem_dfu_transfer_start(void)
     __ASSERT(retval == 0, "dfu_client_connect() failed, err %d", retval);
 
     retval = dfu_client_download(&dfu);
-    __ASSERT(retval == 0, "dfu_client_download() failed, err %d", retval);
+    __ASSERT(retval != -1, "dfu_client_download() failed, err %d", retval);
 }
 
 
@@ -166,7 +179,7 @@ static void app_modem_dfu_transfer_apply(void)
                                      NULL,
                                      0);
         __ASSERT(retval != -1, "Failed to revert to the old firmware.\n");
-        printk("Requested reverting to the old firmware.\n");
+        LOG_INF("Requested reverting to the old firmware.\n");
 
         dfu.offset = 0;
 
@@ -176,7 +189,7 @@ static void app_modem_dfu_transfer_apply(void)
                              &dfu.offset,
                              sizeof(dfu.offset));
         __ASSERT(retval != -1, "Failed to reset offset.\n");
-        printk("Reset offset.\n");
+        LOG_INF("Reset offset.\n");
 
         // Delete the backup
         retval = nrf_setsockopt(m_modem_dfu_fd,
@@ -185,7 +198,7 @@ static void app_modem_dfu_transfer_apply(void)
                              NULL,
                              0);
         __ASSERT(retval != -1, "Failed to reset offset.\n");
-        printk("Reset offset.\n");
+        LOG_INF("Reset offset.\n");
 
     } else {
         uint32_t retval = nrf_setsockopt(m_modem_dfu_fd,
@@ -194,7 +207,7 @@ static void app_modem_dfu_transfer_apply(void)
                                          NULL,
                                          0);
         __ASSERT(retval != -1, "Failed to apply the new firmware.\n");
-        printk("Requested apply of new firmware.\n");
+        LOG_INF("Requested apply of new firmware.\n");
     }
 
 
@@ -211,7 +224,7 @@ static int app_dfu_client_event_handler(struct dfu_client_object *const dfu,
                   enum dfu_client_evt event,
                   u32_t error)
 {
-    int err;
+    int retval;
 
     switch (event) {
     case DFU_CLIENT_EVT_DOWNLOAD_INIT: {
@@ -219,16 +232,31 @@ static int app_dfu_client_event_handler(struct dfu_client_object *const dfu,
         break;
     }
     case DFU_CLIENT_EVT_DOWNLOAD_FRAG: {
-         int sent = 0;
+        LOG_INF("Download fragment");
+        int sent = 0;
 
-         sent = nrf_send(m_modem_dfu_fd,
-                            dfu->fragment,
-                            dfu->fragment_size,
-                            0);
+        sent = nrf_send(m_modem_dfu_fd,
+                        dfu->fragment,
+                        dfu->fragment_size,
+                        0);
 
-         if (sent == -1) {
+        LOG_INF("Modem fragment sent = %d", sent);
+
+        if (sent == -1) {
+            // Delete ongoing image transfer and start again.
+            // Delete the backup
+            retval = nrf_setsockopt(m_modem_dfu_fd,
+                                 NRF_SOL_DFU,
+                                 NRF_SO_DFU_BACKUP_DELETE,
+                                 NULL,
+                                 0);
+            __ASSERT(retval != -1, "Failed to reset offset.\n");
+            LOG_INF("Reset offset.\n");
+
+            __ASSERT(false, "Please restart the application\n");
+
             return -1;
-         }
+        }
 
         break;
     }
@@ -236,8 +264,8 @@ static int app_dfu_client_event_handler(struct dfu_client_object *const dfu,
         LOG_INF("Download completed");
         if (!error) {
             dfu_client_disconnect(dfu);
-            err = dfu_client_apply(dfu);
-            if (err) {
+            retval = dfu_client_apply(dfu);
+            if (retval) {
                 /* Firmware upgrade failed. */
             }
             app_modem_dfu_transfer_apply();
