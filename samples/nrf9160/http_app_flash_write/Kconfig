@@ -1,0 +1,23 @@
+#
+# Copyright (c) 2019 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-BSD-5-Clause-Nordic
+#
+
+menu "nRF91 HTTP Client Flash Write example"
+
+config FLASH_OFFSET
+	hex "Default start address for flash write in this sample"
+	default 0x62000
+
+config HOST
+	string "Host name"
+
+config RESOURCE
+	string "The file to download"
+
+endmenu
+
+menu "Zephyr Kernel"
+source "$ZEPHYR_BASE/Kconfig.zephyr"
+endmenu
