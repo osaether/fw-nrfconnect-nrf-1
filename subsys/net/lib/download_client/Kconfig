@@ -8,9 +8,6 @@ menuconfig  NRF_DOWNLOAD_CLIENT
 	bool "Download client"
 
 if NRF_DOWNLOAD_CLIENT
-config NRF_DOWNLOAD_MAX_REQUEST_SIZE
-	int "Request size"
-	default 256
 
 config NRF_DOWNLOAD_MAX_FRAGMENT_SIZE
 	int "Fragment size"

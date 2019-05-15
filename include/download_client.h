@@ -23,61 +23,34 @@
 #ifndef DOWNLOAD_CLIENT_H__
 #define DOWNLOAD_CLIENT_H__
 
+#include <zephyr.h>
 #include <zephyr/types.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct download_client;
-
-/** @brief Download states. */
-enum download_client_status {
-	/** Indicates that the client was either never connected
-	 *  to the server or is now disconnected.
-	 */
-	DOWNLOAD_CLIENT_STATUS_IDLE      = 0x00,
-	/** Indicates that the client is connected to the server
-	 *  and there is no ongoing download.
-	 */
-	DOWNLOAD_CLIENT_STATUS_CONNECTED = 0x01,
-	/** Indicates that the client is connected to the server
-	 *  and download is in progress.
-	 */
-	DOWNLOAD_CLIENT_STATUS_DOWNLOAD_INPROGRESS = 0x02,
-	/** Indicates that the client is connected to the server
-	 *  and download is complete.
-	 */
-	DOWNLOAD_CLIENT_STATUS_DOWNLOAD_COMPLETE = 0x03,
-	/** Indicates that the object download is halted by the
-	 *  application. This status indicates that the application
-	 *  identified a failure when handling the
-	 *  @ref DOWNLOAD_CLIENT_EVT_DOWNLOAD_FRAG event.
-	 */
-	DOWNLOAD_CLIENT_STATUS_HALTED = 0x04,
-	/** Indicates that an error occurred and the download
-	 *  cannot continue.
-	 */
-	DOWNLOAD_CLIENT_ERROR = 0xFF
-};
-
-
 /** @brief Download events. */
-enum download_client_evt {
+enum download_client_evt_id {
 	/** Indicates an error during download.
 	 *  The application should disconnect and retry the operation
 	 *  when receiving this event.
 	 */
 	DOWNLOAD_CLIENT_EVT_ERROR = 0x00,
-	/** Indicates reception of a fragment during download.
-	 *  The @p fragment field of the @ref download_client object
-	 *  points to the object fragment, and the fragment size
-	 *  indicates the size of the fragment.
-	 */
-	DOWNLOAD_CLIENT_EVT_DOWNLOAD_FRAG = 0x01,
-	/** Indicates that the download is complete.
-	 */
-	DOWNLOAD_CLIENT_EVT_DOWNLOAD_DONE = 0x02,
+	DOWNLOAD_CLIENT_EVT_FRAGMENT = 0x01,
+	DOWNLOAD_CLIENT_EVT_CONN_CLOSED = 0x2,
+	DOWNLOAD_CLIENT_EVT_DONE = 0x03,
+};
+
+struct download_client_evt {
+	enum download_client_evt_id id;
+	union  {
+		int error;
+		struct {
+			const void *buf;
+			size_t len;
+		} fragment;
+	};
 };
 
 /** @brief Download client asynchronous event handler.
@@ -97,8 +70,8 @@ enum download_client_evt {
  *           Other values indicate that the application failed to handle
  *           the event.
  */
-typedef int (*download_client_event_handler_t)(struct download_client *client,
-				enum download_client_evt event, u32_t status);
+typedef int (*download_client_event_handler_t)(
+	const struct download_client_evt *event);
 
 /** @brief Object download client instance that describes the state of download.
  */
@@ -107,43 +80,31 @@ struct download_client {
 	 *  This buffer can be read by the application if necessary,
 	 *  but must never be written to.
 	 */
-	char resp_buf[CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE];
-	/** Buffer used to create requests to the server.
-	 *  This buffer can be read by the application if necessary,
-	 *  but must never be written to.
-	 */
-	char req_buf[CONFIG_NRF_DOWNLOAD_MAX_REQUEST_SIZE];
-	/** Pointer to the object fragment in @p resp_buf.
-	 *  The response from the server contains protocol metadata
-	 *  in addition to the object fragment. On every
-	 *  DOWNLOAD_CLIENT_EVT_DOWNLOAD_FRAG event, this pointer is
-	 *  updated to point to the latest object fragment.
-	 *  This pointer shall not be updated by the application.
-	 */
-	char *fragment;
-	/** Size of the fragment. The size is updated on every
-	 *  DOWNLOAD_CLIENT_EVT_DOWNLOAD_FRAG event.
-	 */
-	int fragment_size;
+	char buf[CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE];
 	/** Transport file descriptor.
 	 *  If negative, the transport is disconnected.
 	 */
 	int fd;
-	/** Total size of the object being downloaded.
-	 * If negative, the download is in progress.
-	 * If zero, the size is unknown.
-	 */
-	int object_size;
-	/** Current size of the object being downloaded. */
-	volatile int download_size;
-	/** Status of the transfer (see @ref download_client_status). */
-	volatile int status;
+
+	K_THREAD_STACK_MEMBER(thread_stack, 2048);
+	struct k_thread thread;
+	k_tid_t tid;
+	struct k_sem sem;
+
+	size_t file_size;
+	size_t progress;
+	size_t offset;
+
+	int status;
+	bool has_header;
+
 	/** Server that hosts the object. */
-	const char *host;
+	char *host;
 	/** Resource to be downloaded. */
-	const char *resource;
+	char *file;
 	/** Event handler. Must not be NULL. */
-	const download_client_event_handler_t callback;
+	download_client_event_handler_t callback;
+
 };
 
 /** @brief Initialize the download client object for a given host and resource.
@@ -163,7 +124,8 @@ struct download_client {
  * @retval 0  If the operation was successful.
  * @retval -1 Otherwise.
  */
-int download_client_init(struct download_client *client);
+int download_client_init(struct download_client *client,
+			 download_client_event_handler_t callback);
 
 /**@brief Establish a connection to the server.
  *
@@ -179,7 +141,7 @@ int download_client_init(struct download_client *client);
  * @retval 0  If the operation was successful.
  * @retval -1 Otherwise.
  */
-int download_client_connect(struct download_client *client);
+int download_client_connect(struct download_client *client, char *host);
 
 /**@brief Start downloading the object.
  *
@@ -203,17 +165,11 @@ int download_client_connect(struct download_client *client);
  * @retval 0  If the operation was successful.
  * @retval -1 Otherwise.
  */
-int download_client_start(struct download_client *client);
+int download_client_start(struct download_client *client,
+			  char *file, size_t offset);
 
-/**@brief Advance the object download.
- *
- * Call this API to advance the download state identified by the @p status
- * field of @p client. This is a blocking call. You can poll the @p fd field of
- * @p client to decide whether to call this method.
- *
- * @param[in] client The client instance.
- */
-void download_client_process(struct download_client *client);
+void download_client_pause(struct download_client *);
+void download_client_resume(struct download_client *);
 
 /**@brief Disconnect from the server.
  *
@@ -230,7 +186,7 @@ void download_client_process(struct download_client *client);
  * @param[in] client The client instance.
  *
  */
-void download_client_disconnect(struct download_client *client);
+int download_client_disconnect(struct download_client *client);
 
 #ifdef __cplusplus
 }

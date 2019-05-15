@@ -7,21 +7,24 @@
 #include <stdio.h>
 #include <string.h>
 #include <download_client.h>
+#include <zephyr.h>
 #include <net/socket.h>
 #include <zephyr/types.h>
+#include <misc/util.h>
 #include <logging/log.h>
 
-LOG_MODULE_REGISTER(http_dfu);
+LOG_MODULE_REGISTER(download_client);
 
+#define GET_TEMPLATE                                                           \
+	"GET /%s HTTP/1.1\r\n"                                                 \
+	"Host: %s\r\n"                                                         \
+	"Connection: keep-alive\r\n"                                           \
+	"Range: bytes=%u-%u\r\n"                                               \
+	"\r\n"
 
-#define REQUEST_TEMPLATE "GET %s HTTP/1.1\r\n"\
-	"Host: %s\r\n"\
-	"Connection: keep-alive\r\n"\
-	"Range: bytes=%d-%d\r\n\r\n"
-
-
-static int resolve_and_connect(const char *const host, const char *const port,
-					u32_t family, u32_t proto)
+static int resolve_and_connect(const char *const host,
+			       const char *const port,
+			       u32_t family, u32_t proto)
 {
 	int fd;
 
@@ -36,7 +39,7 @@ static int resolve_and_connect(const char *const host, const char *const port,
 	    .ai_protocol = proto,
 	};
 
-	LOG_INF("Requesting getaddrinfo() for %s", host);
+	LOG_DBG("Requesting getaddrinfo() for %s", host);
 
 	/* DNS resolve the port. */
 	int rc = getaddrinfo(host, port, &hints, &addrinf);
@@ -60,14 +63,14 @@ static int resolve_and_connect(const char *const host, const char *const port,
 		while (addr != NULL) {
 			remoteaddr = addr->ai_addr;
 
-			LOG_INF("Resolved address family %d\n",
+			LOG_DBG("Resolved address family %d\n",
 				addr->ai_family);
 
 			if (remoteaddr->sa_family == family) {
 				((struct sockaddr_in *)remoteaddr)->sin_port =
 					htons(80);
 
-				LOG_HEXDUMP_INF((const uint8_t *)remoteaddr,
+				LOG_HEXDUMP_DBG((const uint8_t *)remoteaddr,
 					addr->ai_addrlen, "Resolved addr");
 
 				/** TODO:
@@ -92,351 +95,348 @@ static int resolve_and_connect(const char *const host, const char *const port,
 	return fd;
 }
 
-static void rxdata_flush(struct download_client * const client)
+static int http_request_send(const struct download_client *client, size_t len)
 {
-	if (client == NULL || client->host == NULL ||
-		client->callback == NULL ||
-		client->status == DOWNLOAD_CLIENT_STATUS_IDLE) {
-		return;
-	}
+	int sent;
+	size_t off = 0;
 
-	int flush_len = recv(client->fd, client->resp_buf,
-				CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE, 0);
-
-	LOG_INF("flush(): len %d\n", flush_len);
-	if (flush_len == -1) {
-		if (errno == EAGAIN) {
-			LOG_ERR("flused %d\n", flush_len);
-		} else {
-			/* Something is wrong on the socket! */
-			client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR,
-					errno);
-		}
-	}
-
-	memset(client->resp_buf, 0, CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE);
-}
-
-static int fragment_request(struct download_client * const client, bool flush,
-				bool connnection_close)
-{
-	if (client == NULL || client->host == NULL ||
-	    client->callback == NULL || client->resource == NULL) {
-		LOG_ERR("request(): Invalid client object!");
-		return -1;
-	}
-
-	if (flush == true) {
-		rxdata_flush(client);
-	}
-
-	if (connnection_close == true) {
-		LOG_DBG("request(): connection resume.");
-		(void)close(client->fd);
-		client->fd = -1;
-		client->fd = resolve_and_connect(client->host, NULL, AF_INET,
-					 IPPROTO_TCP);
-		if (client->fd < 0) {
-			LOG_ERR("frequest(): connect() failed, err %d",  errno);
-			client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR,
-					ECONNRESET);
-			return -1;
-		}
-	}
-
-	memset(client->req_buf, 0, CONFIG_NRF_DOWNLOAD_MAX_REQUEST_SIZE);
-
-	int request_len = snprintf(client->req_buf,
-				CONFIG_NRF_DOWNLOAD_MAX_REQUEST_SIZE,
-				REQUEST_TEMPLATE, client->resource,
-				client->host, client->download_size,
-				(client->download_size +
-				CONFIG_NRF_DOWNLOAD_MAX_FRAGMENT_SIZE - 1));
-
-	LOG_INF("request(), request length %d, state = %d\n",
-		request_len, client->status);
-
-	if ((request_len > 0) &&
-		(request_len < CONFIG_NRF_DOWNLOAD_MAX_REQUEST_SIZE)) {
-
-		client->status = DOWNLOAD_CLIENT_STATUS_DOWNLOAD_INPROGRESS;
-		LOG_INF("Request: %s", client->req_buf);
-
-		int written = 0;
-
-		while ((written != request_len)) {
-			written = send(client->fd, &client->req_buf[written],
-						 (request_len - written), 0);
-			if (written <= 0) {
-				/** Could not send the whole of request.
-				 *  Cannot continue.
-				 */
-				return -1;
-			}
+	while (len) {
+		sent = send(client->fd, client->buf + off, len, 0);
+		if (sent <= 0) {
+			return -EIO;
 		}
 
-	} else {
-		LOG_ERR("Cannot create request, buffer too small!");
-		return -1;
+		off += sent;
+		len -= sent;
 	}
 
 	return 0;
 }
 
-static void request_and_notify(struct download_client * const client,
-				bool flush, bool connnection_close)
+static int get_request_send(struct download_client *client)
 {
+	__ASSERT(client, "NULL object");
+	__ASSERT(client->host, "NULL host");
+	__ASSERT(client->file, "NULL resource");
 
-	if (-1 == fragment_request(client, flush, connnection_close)) {
-		client->status = DOWNLOAD_CLIENT_ERROR;
-		client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR,
-					ECONNRESET);
+	int err;
+	int len;
+	size_t off;
+
+	/* Offset of last byte in range (Content-Range) */
+	off = client->progress + CONFIG_NRF_DOWNLOAD_MAX_FRAGMENT_SIZE - 1;
+
+	if (client->file_size != 0) {
+		/* Don't request bytes past the end of file */
+		off = MIN(off, client->file_size);
 	}
+
+	len = snprintf(client->buf, CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE,
+		       GET_TEMPLATE, client->file, client->host,
+		       client->progress, off);
+
+	if (len < 0 || len > CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE) {
+		LOG_ERR("Cannot create GET request, buffer too small");
+		return -ENOMEM;
+	}
+
+	LOG_HEXDUMP_DBG(client->buf, len, "HTTP request");
+
+	LOG_DBG("Sending HTTP request");
+
+	err = http_request_send(client, len);
+	if (err) {
+		return err;
+	}
+
+	LOG_DBG("HTTP request sent");
+
+	return 0;
 }
 
-int download_client_init(struct download_client * const client)
+static int header_parse(struct download_client *client)
 {
-	LOG_INF("init()\n");
+	char *p;
+	size_t hdr;
 
-	if (client == NULL || client->host == NULL ||
-		client->callback == NULL ||
-		client->resource == NULL) {
-		LOG_ERR("init(): Invalid client object!");
-		return -1;
+	p = strstr(client->buf, "\r\n\r\n");
+	if (!p) {
+		/* Awaiting full GET response */
+		LOG_DBG("Awaiting full header in response");
+		return 1;
+	}
+
+	/* Offset of the header in the buffer */
+	hdr = p + strlen("\r\n\r\n") - client->buf;
+
+	__ASSERT(hdr < sizeof(client->buf), "Buffer overflow");
+
+	LOG_DBG("GET header size: %u", hdr);
+	LOG_HEXDUMP_DBG(client->buf, hdr, "GET");
+
+	/* If file size is not known, read it from the header */
+	if (client->file_size == 0) {
+		p = strstr(client->buf, "Content-Range: bytes");
+		if (!p) {
+			/* Cannot continue */
+			LOG_ERR("Server did not send "
+				"\"Content-Range\" in response");
+			return -1;
+		}
+		p = strstr(p, "/");
+		if (!p) {
+			/* Cannot continue */
+			LOG_ERR("Server did not send file size in response");
+			return -1;
+		}
+
+		client->file_size = atoi(p + 1);
+
+		LOG_INF("File size = %d", client->file_size);
+	}
+
+	if (client->offset != hdr) {
+		/* The current buffer contains some payload bytes.
+		 * Copy them at the beginning of the buffer
+		 * then update the offset.
+		 */
+		LOG_WRN("Copying %u payload bytes", client->offset - hdr);
+		memcpy(client->buf, client->buf + hdr,
+		       client->offset - hdr);
+
+		client->offset -= hdr;
+	} else {
+		/* Reset the offset.
+		 * The payload is received in an empty buffer.
+		 */
+		client->offset = 0;
+	}
+
+	return 0;
+}
+
+static int fragment_send(const struct download_client *client)
+{
+	__ASSERT(client->offset <= CONFIG_NRF_DOWNLOAD_MAX_FRAGMENT_SIZE,
+		 "Fragment overflow!");
+
+	__ASSERT(client->offset <= CONFIG_NRF_DOWNLOAD_MAX_RESPONSE_SIZE,
+		 "Buffer overflow!");
+
+	const struct download_client_evt evt = {
+		.id = DOWNLOAD_CLIENT_EVT_FRAGMENT,
+		.fragment = {
+			.buf = client->buf,
+			.len = client->offset,
+		}
+	};
+
+	return client->callback(&evt);
+}
+
+void download_thread(void *pclient, void *a2, void *a3)
+{
+	int rc;
+	size_t len;
+	struct download_client *dl;
+
+	dl = pclient;
+
+	while (true) {
+		__ASSERT(dl->offset < sizeof(dl->buf), "Buffer overflow");
+
+		LOG_DBG("Receiving bytes..");
+		len = recv(dl->fd, dl->buf + dl->offset,
+			   sizeof(dl->buf) - dl->offset, 0);
+
+		if (len == -1 && errno != EAGAIN) {
+			LOG_ERR("Error reading from socket: recv() errno %d",
+				errno);
+			const struct download_client_evt evt = {
+				.id = DOWNLOAD_CLIENT_EVT_ERROR,
+				.error = -ENOTCONN
+			};
+			dl->callback(&evt);
+			// thread dead?
+			break;
+		}
+
+		if (len == 0) {
+			LOG_WRN("Peer closed connection!");
+			const struct download_client_evt evt = {
+				.id = DOWNLOAD_CLIENT_EVT_ERROR,
+				.error = -ECONNRESET
+			};
+			dl->callback(&evt);
+			k_thread_suspend(dl->tid);
+			continue;
+		}
+
+		LOG_DBG("Read %d bytes from socket", len);
+
+		/* Accumulate buffer offset */
+		dl->offset += len;
+
+		if (!dl->has_header) {
+			rc = header_parse(dl);
+			if (rc > 0) {
+				/* Wait for payload */
+				continue;
+			}
+			if (rc < 0) {
+				/* thread dead? */
+				break;
+			}
+
+			dl->has_header = true;
+		}
+
+		/* Accumulate overall file progress.
+		 *
+		 * If the last recv() call read an HTTP header,
+		 * the offset has been moved to the end of the header in
+		 * header_parse(). Thus, we accumulate the offset
+		 * to the progress.
+		 *
+		 * If the last recv() call received only a HTTP message body,
+		 * then we accumulate 'len'.
+		 *
+		 */
+		dl->progress += MIN(dl->offset, len);
+
+		LOG_INF("Downloaded bytes: %u/%u", dl->progress,
+			dl->file_size);
+
+		LOG_HEXDUMP_DBG(dl->buf, dl->offset, "Fragment");
+
+		if (dl->progress == dl->file_size) {
+			LOG_INF("Download complete");
+			/* Send out last fragment */
+			fragment_send(dl);
+			const struct download_client_evt evt = {
+				.id = DOWNLOAD_CLIENT_EVT_DONE,
+			};
+			dl->callback(&evt);
+			k_thread_suspend(dl->tid);
+			continue;
+		}
+
+		if (dl->offset < CONFIG_NRF_DOWNLOAD_MAX_FRAGMENT_SIZE) {
+			LOG_DBG("Awaiting full response (%u)", dl->offset);
+			continue;
+		}
+
+		/* Send fragment to application */
+		fragment_send(dl);
+
+		/* Request next fragment */
+		dl->offset = 0;
+		dl->has_header = false;
+
+		get_request_send(dl);
+	}
+
+	return;
+}
+
+int download_client_init(struct download_client *const client,
+			 download_client_event_handler_t callback)
+{
+	if (client == NULL || callback == NULL) {
+		return -EINVAL;
 	}
 
 	client->fd = -1;
-	client->status = DOWNLOAD_CLIENT_STATUS_IDLE;
+	client->tid = NULL;
+	client->callback = callback;
 
 	return 0;
 }
 
-int download_client_connect(struct download_client * const client)
+int download_client_connect(struct download_client * const client, char *host)
 {
-	int fd;
-
-	if (client == NULL || client->host == NULL ||
-	    client->callback == NULL) {
-		LOG_ERR("connect(): Invalid client object!");
-		return -1;
+	if (client == NULL || host == NULL) {
+		return -EINVAL;
 	}
 
-	if ((client->fd != -1) &&
-		(client->status == DOWNLOAD_CLIENT_STATUS_CONNECTED)) {
-
-		LOG_ERR("connect(): already connected, fd %d",
-			client->fd);
+	if (client->fd != -1) {
+		/* Already connected */
 		return 0;
 	}
 
-	/* TODO: Parse the post for name, port and protocol. */
-	fd = resolve_and_connect(client->host, NULL, AF_INET, IPPROTO_TCP);
-	if (fd < 0) {
-		LOG_ERR("connect(): resolve_and_connect() failed, err %d",
-			errno);
-		return -1;
+	client->host = host;
+
+	/* TODO: Parse the host for name, port and protocol. */
+	client->fd =
+		resolve_and_connect(client->host, NULL, AF_INET, IPPROTO_TCP);
+	if (client->fd < 0) {
+		LOG_ERR("resolve_and_connect() failed, err %d", errno);
+		return -EINVAL;
 	}
 
-
-	client->fd = fd;
-	client->status = DOWNLOAD_CLIENT_STATUS_CONNECTED;
-
-	LOG_INF("connect(): Success! State %d, fd %d",
-		client->status, client->fd);
+	LOG_INF("Socket ready");
 
 	return 0;
 }
 
-void download_client_disconnect(struct download_client * const client)
+int download_client_disconnect(struct download_client * const client)
+{
+	int err;
+
+	if (client == NULL || client->fd < 0) {
+		return -EINVAL;
+	}
+
+	err = close(client->fd);
+	if (err) {
+		return err;
+	}
+
+	client->fd = -1;
+
+	return 0;
+}
+
+int download_client_start(struct download_client *client, char *file,
+			  size_t offset)
 {
 	if (client == NULL || client->fd < 0) {
-		LOG_ERR("disconnect(): Invalid client object!");
-		return;
+		return -EINVAL;
 	}
 
-	close(client->fd);
-	client->fd = -1;
-	client->status = DOWNLOAD_CLIENT_STATUS_IDLE;
-}
+	client->file = file;
+	client->file_size = 0;
+	client->progress = offset;
 
-int download_client_start(struct download_client * const client)
-{
-	if (client == NULL || client->fd < 0 ||
-		(client->status != DOWNLOAD_CLIENT_STATUS_CONNECTED)) {
-		LOG_ERR("download(): Invalid client object/state!");
-		return -1;
+	client->offset = 0;
+	client->has_header = false;
+
+	LOG_INF("Downloading: %s [%u]", client->file, client->progress);
+
+	if (client->progress % CONFIG_NRF_DOWNLOAD_MAX_FRAGMENT_SIZE) {
+		LOG_DBG("Attempting to continue from non-2^ offset..");
 	}
 
-	client->object_size = -1;
-	return fragment_request(client, false, false);
-}
+	get_request_send(client);
 
-void download_client_process(struct download_client * const client)
-{
-	int len;
-
-	if (client == NULL || client->fd < 0 ||
-		client->status != DOWNLOAD_CLIENT_STATUS_DOWNLOAD_INPROGRESS) {
-		LOG_ERR("process(): Invalid client object/state!");
-		return;
-	}
-
-	memset(client->resp_buf, 0, sizeof(client->resp_buf));
-
-	len = recv(client->fd, client->resp_buf, sizeof(client->resp_buf),
-			MSG_PEEK);
-	LOG_DBG("process(), fd = %d, state = %d, length = %d, "
-		"errno %d\n", client->fd, client->status, len, errno);
-
-	if (len == -1) {
-		if (errno != EAGAIN) {
-			LOG_ERR("recv err errno %d!", errno);
-			client->status = DOWNLOAD_CLIENT_ERROR;
-			client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR,
-				ENOTCONN);
-		}
-		return;
-	}
-	if (len == 0) {
-		LOG_ERR("recv returned 0, peer closed connection!");
-		client->status = DOWNLOAD_CLIENT_ERROR;
-		client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR, ECONNRESET);
-		return;
-	}
-
-	LOG_INF("Received response of size %d", len);
-
-	int payload_size = 0;
-	int total_size = 0;
-
-	char *content_range_header = strstr(client->resp_buf,
-		"Content-Range: bytes");
-
-	if (content_range_header == NULL) {
-		/* Return and wait for the header to arrive. */
-		LOG_DBG("Wait for Content-Range header.");
-		return;
-	}
-
-	content_range_header += strlen("Content-Range: bytes");
-	char *range_str = strstr(content_range_header, " ");
-
-	if (range_str == NULL) {
-		/* Return and wait for the header to arrive. */
-		LOG_DBG("Wait for Content-Range header value.");
-		return;
-	}
-
-	int download_offest = atoi(range_str+1);
-
-	if (download_offest != client->download_size) {
-		LOG_DBG("Start download_size %d, expected %d",
-		download_offest, client->download_size);
-		/* Returned range not as expected, cannot continue. */
-		client->status = DOWNLOAD_CLIENT_ERROR;
-		client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR, EFAULT);
-		return;
-	}
-
-	char *totalsize_str = strstr(content_range_header, "/");
-
-	if (totalsize_str == NULL) {
-		/* Return and wait for size to arrive. */
-		LOG_DBG("Wait for Total length.");
-		return;
-	}
-
-	total_size = atoi(totalsize_str + 1);
-	LOG_DBG("Total size %d", total_size);
-
-	char *content_length_header = strstr(client->resp_buf,
-						"Content-Length: ");
-
-	if (content_length_header == NULL) {
-		/* Return and wait for the header to arrive. */
-		LOG_DBG("Wait for Content-Length header.");
-		return;
-	}
-
-	content_length_header += strlen("Content-Length: ");
-	payload_size = atoi(content_length_header);
-
-	if (total_size)	{
-		if (client->object_size == -1) {
-			client->object_size = total_size;
-		} else  if (client->object_size != total_size) {
-			LOG_ERR("Firmware size changed from %d to %d during "
-				"download!", client->object_size, total_size);
-			client->status = DOWNLOAD_CLIENT_ERROR;
-			client->callback(client, DOWNLOAD_CLIENT_EVT_ERROR,
-			EFAULT);
-		}
-	}
-
-	/** Allow a full sized fragment, except the last one. The last one can
-	 *  be smaller.
-	 */
-	if ((payload_size != CONFIG_NRF_DOWNLOAD_MAX_FRAGMENT_SIZE) &&
-		(client->download_size + payload_size != client->object_size)) {
-		LOG_DBG("Wait for payload.");
-		return;
-	}
-
-	char *payload = strstr(client->resp_buf, "\r\n\r\n");
-	bool connection_resume = false;
-
-	if (payload == NULL) {
-		LOG_DBG("Wait for payload.");
-		return;
-	}
-	payload += strlen("\r\n\r\n");
-	int expected_payload_size = len - (int)(payload - client->resp_buf);
-
-	if (payload_size != expected_payload_size) {
-		/* Wait for entire payload. */
-		LOG_DBG("Expected payload %d, received %d\n", payload_size,
-			expected_payload_size);
-		return;
-	}
-
-	char *connnection_header = strstr(client->resp_buf, "Connection: ");
-
-	if (connnection_header != NULL) {
-		connnection_header += strlen("Connection: ");
-		char *connnection_close = strstr(connnection_header, "close");
-
-		if (connnection_close != NULL) {
-			LOG_INF("Resume TCP connection\n");
-			connection_resume = true;
-		}
-	}
-
-	/** Parse the response, send the firmware to the modem.
-	 *  And generate the right events.
-	 */
-	client->fragment = payload;
-	client->fragment_size = payload_size;
-
-	/** Continue download if application returns success,
-	 *  else, halt.
-	 */
-	if (0 ==
-	client->callback(client, DOWNLOAD_CLIENT_EVT_DOWNLOAD_FRAG, 0)) {
-
-		client->download_size += payload_size;
-
-		if (client->download_size == client->object_size) {
-			client->status =
-				DOWNLOAD_CLIENT_STATUS_DOWNLOAD_COMPLETE;
-			client->callback(client,
-				DOWNLOAD_CLIENT_EVT_DOWNLOAD_DONE,
-				0);
-			rxdata_flush(client);
-		} else {
-			request_and_notify(client, true, connection_resume);
-		}
+	if (client->tid == NULL) {
+		client->tid = k_thread_create(
+			&client->thread, client->thread_stack, 2048,
+			download_thread, client, NULL, NULL,
+			K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
 	} else {
-		client->download_size -= payload_size;
-		client->status = DOWNLOAD_CLIENT_STATUS_HALTED;
+		k_thread_resume(client->tid);
 	}
+
+	return 0;
+}
+
+void download_client_pause(struct download_client *client)
+{
+	k_thread_suspend(client->tid);
+}
+
+void download_client_resume(struct download_client *client)
+{
+	k_thread_resume(client->tid);
 }

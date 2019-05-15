@@ -23,15 +23,10 @@ static struct		device *gpiob;
 static struct		gpio_callback gpio_cb;
 static u32_t		flash_address;
 
-static int app_download_client_event_handler(struct download_client *const dfu,
-			enum download_client_evt event, u32_t status);
+static int download_client_callback(const struct download_client_evt *);
 
 
-static struct download_client dfu = {
-	.host = CONFIG_DOWNLOAD_HOST,
-	.resource = CONFIG_DOWNLOAD_FILE,
-	.callback = app_download_client_event_handler
-};
+static struct download_client dfu;
 
 
 /**@brief Recoverable BSD library error. */
@@ -64,7 +59,7 @@ static int app_dfu_init(void)
 		return 1;
 	}
 
-	int retval = download_client_init(&dfu);
+	int retval = download_client_init(&dfu, download_client_callback);
 
 	if (retval != 0) {
 		printk("download_client_init() failed, err %d", retval);
@@ -77,7 +72,7 @@ static int app_dfu_init(void)
 /**@brief Start transfer of the file. */
 static int app_dfu_transfer_start(void)
 {
-	int retval = download_client_connect(&dfu);
+	int retval = download_client_connect(&dfu, CONFIG_DOWNLOAD_HOST);
 
 	if (retval != 0) {
 		printk("download_client_connect() failed, err %d",
@@ -85,7 +80,7 @@ static int app_dfu_transfer_start(void)
 		return 1;
 	}
 
-	retval = download_client_start(&dfu);
+	retval = download_client_start(&dfu, CONFIG_DOWNLOAD_FILE, 0);
 	if (retval != 0) {
 		printk("download_client_start() failed, err %d",
 			retval);
@@ -131,19 +126,18 @@ static int flash_page_erase_if_needed(u32_t address)
 }
 
 
-static int app_download_client_event_handler(
-	struct download_client *const dfu,
-	enum download_client_evt event, u32_t error)
+static int download_client_callback(const struct download_client_evt *event)
 {
 	int err;
 
-	switch (event) {
-	case DOWNLOAD_CLIENT_EVT_DOWNLOAD_FRAG: {
-
-		if (dfu->object_size > PM_MCUBOOT_SECONDARY_SIZE) {
+	switch (event->id) {
+	case DOWNLOAD_CLIENT_EVT_FRAGMENT: {
+#if 0
+		if (dfu->file_size > PM_MCUBOOT_SECONDARY_SIZE) {
 			printk("Requested file too big to fit in flash\n");
 			return 1;
 		}
+#endif
 		err = flash_page_erase_if_needed(flash_address);
 		if (err != 0) {
 			return 1;
@@ -154,8 +148,8 @@ static int app_download_client_event_handler(
 				err);
 			return 1;
 		}
-		err = flash_write(flash_dev, flash_address, dfu->fragment,
-							dfu->fragment_size);
+		err = flash_write(flash_dev, flash_address,
+				  event->fragment.buf, event->fragment.len);
 		if (err != 0) {
 			printk("Flash write error %d at address %08x\n",
 				err, flash_address);
@@ -167,13 +161,13 @@ static int app_download_client_event_handler(
 				err);
 			return 1;
 		}
-		flash_address += dfu->fragment_size;
+		flash_address += event->fragment.len;
 		break;
 	}
 
-	case DOWNLOAD_CLIENT_EVT_DOWNLOAD_DONE:
-		flash_address = PM_MCUBOOT_SECONDARY_ADDRESS
-			+PM_MCUBOOT_SECONDARY_SIZE-0x4;
+	case DOWNLOAD_CLIENT_EVT_DONE:
+		flash_address = PM_MCUBOOT_SECONDARY_ADDRESS +
+				PM_MCUBOOT_SECONDARY_SIZE - 0x4;
 		err = flash_page_erase_if_needed(flash_address);
 		if (err != 0) {
 			return 1;
@@ -187,7 +181,7 @@ static int app_download_client_event_handler(
 		break;
 
 	case DOWNLOAD_CLIENT_EVT_ERROR: {
-		download_client_disconnect(dfu);
+		download_client_disconnect(&dfu);
 		printk("Download client error, please restart "
 			"the application\n");
 		break;
@@ -264,6 +258,7 @@ static int application_update(void)
 	int err;
 
 	start_dfu = false;
+
 	err = app_dfu_init();
 	if (err != 0) {
 		return 1;
@@ -274,22 +269,8 @@ static int application_update(void)
 		return 1;
 	}
 
-	while (true) {
-		if ((dfu.status == DOWNLOAD_CLIENT_STATUS_HALTED) ||
-			(dfu.status == DOWNLOAD_CLIENT_ERROR)) {
-			printk("Something went wrong, please restart the application\n");
-			return 1;
-		} else if (dfu.status ==
-			DOWNLOAD_CLIENT_STATUS_DOWNLOAD_COMPLETE) {
-			printk("Download complete\n");
-			break;
-		}
-		download_client_process(&dfu);
-	}
-	download_client_disconnect(&dfu);
 	return 0;
 }
-
 
 void main(void)
 {
