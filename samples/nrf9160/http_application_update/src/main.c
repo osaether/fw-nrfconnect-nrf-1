@@ -22,6 +22,7 @@ static volatile bool	start_dfu;
 static struct		device *gpiob;
 static struct		gpio_callback gpio_cb;
 static u32_t		flash_address;
+static k_tid_t		main_thread;
 
 static int download_client_callback(const struct download_client_evt *);
 
@@ -177,7 +178,7 @@ static int download_client_callback(const struct download_client_evt *event)
 			printk("boot_request_upgrade returned error %d\n", err);
 			return 1;
 		}
-		printk("DOWNLOAD_CLIENT_EVT_DOWNLOAD_DONE");
+		k_thread_resume(main_thread);
 		break;
 
 	case DOWNLOAD_CLIENT_EVT_ERROR: {
@@ -253,20 +254,23 @@ static int dfu_button_init(void)
 	return 0;
 }
 
-static int application_update(void)
+static int application_init(void)
 {
 	int err;
 
-	start_dfu = false;
+	err = dfu_button_init();
+	if (err != 0) {
+		return err;
+	}
+	
+	err = led_app_version();
+	if (err != 0) {
+		return err;
+	}
 
 	err = app_dfu_init();
 	if (err != 0) {
-		return 1;
-	}
-
-	err = app_dfu_transfer_start();
-	if (err != 0) {
-		return 1;
+		return err;
 	}
 
 	return 0;
@@ -277,21 +281,24 @@ void main(void)
 	int err;
 
 	boot_write_img_confirmed();
-	start_dfu = false;
-	err = dfu_button_init();
+
+	err = application_init();
 	if (err != 0) {
 		return;
 	}
-	err = led_app_version();
-	if (err != 0) {
-		return;
-	}
+
+	main_thread = k_current_get();
 	while (true) {
-		if (start_dfu) {
-			err = application_update();
-			if (err != 0) {
-				return;
-			}
+		printk("Press Button 1 to start the download\n");
+		start_dfu = false;
+		while(!start_dfu) {
 		}
+		err = app_dfu_transfer_start();
+		if (err != 0) {
+			return;
+		}
+
+		k_thread_suspend(main_thread);
+		gpio_pin_enable_callback(gpiob, SW0_GPIO_PIN);
 	}
 }
