@@ -65,7 +65,7 @@ static void init(void)
 {
 	int err;
 	int ret;
-	uint8_t buf[64];
+	uint8_t buf[64] = {0};
 
 	/* Return 'true' when dfu_target_mcuboot_identify() is called */
 	identify_retval = true;
