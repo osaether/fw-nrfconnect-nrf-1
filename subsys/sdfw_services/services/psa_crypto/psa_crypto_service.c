@@ -15,11 +15,18 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(psa_crypto_srvc, CONFIG_SSF_PSA_CRYPTO_SERVICE_LOG_LEVEL);
 
+#define PRINT_HEX(p_label, p_text, len)\
+	({\
+		LOG_INF("---- %s (len: %u): ----", p_label, len);\
+		LOG_HEXDUMP_INF(p_text, len, "Content:");\
+		LOG_INF("---- %s end  ----", p_label);\
+	})
+
 SSF_CLIENT_SERVICE_DEFINE(psa_crypto_srvc, PSA_CRYPTO, cbor_encode_psa_crypto_req,
 			  cbor_decode_psa_crypto_rsp);
 
 #if CONFIG_SOC_NRF54H20_CPUAPP
-static void *mem_region = (void *)DT_REG_ADDR(DT_NODELABEL(cpuapp_cpusec_misc_shm));
+static void *mem_region = (void *)DT_REG_ADDR(DT_NODELABEL(cpuapp_dma_region));
 #else
 static void *mem_region = (void *)DT_REG_ADDR(DT_NODELABEL(cpurad_cpusec_misc_shm));
 #endif
@@ -2790,6 +2797,7 @@ psa_status_t ssf_psa_generate_key(const psa_key_attributes_t *attributes, mbedtl
 	}
 
 	dmm_buffer_out_release(mem_region, attributes_buffer);
+	PRINT_HEX("key_buffer", key_buffer, sizeof(mbedtls_svc_key_id_t));
 	dmm_buffer_in_release(mem_region, key, sizeof(mbedtls_svc_key_id_t), key_buffer);
 
 	return rsp.psa_crypto_rsp_status;
