@@ -11,3 +11,7 @@ service_version = 1
 service_buffer_size = 128
 service_name_str = PSA Crypto
 rsource "../Kconfig.template.service"
+
+config SSF_CRYPTO_DCACHE
+	bool "Select service with DCACHE support"
+	default y
