@@ -92,7 +92,10 @@ int suit_plat_authenticate_manifest(struct zcbor_string *manifest_component_id,
 	}
 #endif /* CONFIG_SDFW_BUILTIN_KEYS */
 
-	if (psa_verify_message(public_key_id, psa_alg, data->value, data->len, signature->value,
+	mbedtls_svc_key_id_t key;
+	key.MBEDTLS_PRIVATE(key_id) = public_key_id;
+	key.MBEDTLS_PRIVATE(owner) = NRF_OWNER_SECURE;
+	if (psa_verify_message(key, psa_alg, data->value, data->len, signature->value,
 			       signature->len) == PSA_SUCCESS) {
 		return SUIT_SUCCESS;
 	}
